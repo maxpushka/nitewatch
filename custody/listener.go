@@ -68,16 +68,17 @@ var _ EventListener = (*Listener)(nil)
 
 // WatchWithdrawStarted subscribes to WithdrawStarted events and sends them to the sink channel.
 // This function blocks forever; run it in a goroutine. The sink channel is closed when it returns.
-func (l *Listener) WatchWithdrawStarted(ctx context.Context, sink chan<- *WithdrawStartedEvent, fromBlock uint64, fromLogIndex uint32) {
+// Returns an error if the listener stops unexpectedly (e.g. backoff limit reached).
+func (l *Listener) WatchWithdrawStarted(ctx context.Context, sink chan<- *WithdrawStartedEvent, fromBlock uint64, fromLogIndex uint32) error {
 	defer close(sink)
 
 	parsedABI, err := IWithdrawMetaData.GetAbi()
 	if err != nil {
-		return
+		return fmt.Errorf("failed to parse IWithdraw ABI: %w", err)
 	}
 	topic := parsedABI.Events["WithdrawStarted"].ID
 
-	listenEvents(ctx, l.client, "withdraw-started", l.contractAddr, l.confirmationBlocks, l.pollInterval, fromBlock, fromLogIndex,
+	return listenEvents(ctx, l.client, "withdraw-started", l.contractAddr, l.confirmationBlocks, l.pollInterval, fromBlock, fromLogIndex,
 		[][]common.Hash{{topic}},
 		func(log types.Log) {
 			ev, err := l.withdrawFilterer.ParseWithdrawStarted(log)
@@ -100,16 +101,17 @@ func (l *Listener) WatchWithdrawStarted(ctx context.Context, sink chan<- *Withdr
 
 // WatchWithdrawFinalized subscribes to WithdrawFinalized events and sends them to the sink channel.
 // This function blocks forever; run it in a goroutine. The sink channel is closed when it returns.
-func (l *Listener) WatchWithdrawFinalized(ctx context.Context, sink chan<- *WithdrawFinalizedEvent, fromBlock uint64, fromLogIndex uint32) {
+// Returns an error if the listener stops unexpectedly.
+func (l *Listener) WatchWithdrawFinalized(ctx context.Context, sink chan<- *WithdrawFinalizedEvent, fromBlock uint64, fromLogIndex uint32) error {
 	defer close(sink)
 
 	parsedABI, err := IWithdrawMetaData.GetAbi()
 	if err != nil {
-		return
+		return fmt.Errorf("failed to parse IWithdraw ABI: %w", err)
 	}
 	topic := parsedABI.Events["WithdrawFinalized"].ID
 
-	listenEvents(ctx, l.client, "withdraw-finalized", l.contractAddr, l.confirmationBlocks, l.pollInterval, fromBlock, fromLogIndex,
+	return listenEvents(ctx, l.client, "withdraw-finalized", l.contractAddr, l.confirmationBlocks, l.pollInterval, fromBlock, fromLogIndex,
 		[][]common.Hash{{topic}},
 		func(log types.Log) {
 			ev, err := l.withdrawFilterer.ParseWithdrawFinalized(log)
@@ -129,20 +131,21 @@ func (l *Listener) WatchWithdrawFinalized(ctx context.Context, sink chan<- *With
 
 // WatchDeposited subscribes to Deposited events and sends them to the sink channel.
 // This function blocks forever; run it in a goroutine. The sink channel is closed when it returns.
-func (l *Listener) WatchDeposited(ctx context.Context, sink chan<- *DepositedEvent, fromBlock uint64, fromLogIndex uint32) {
+// Returns an error if the listener stops unexpectedly.
+func (l *Listener) WatchDeposited(ctx context.Context, sink chan<- *DepositedEvent, fromBlock uint64, fromLogIndex uint32) error {
 	defer close(sink)
 
 	if l.depositFilterer == nil {
-		return
+		return nil
 	}
 
 	parsedABI, err := IDepositMetaData.GetAbi()
 	if err != nil {
-		return
+		return fmt.Errorf("failed to parse IDeposit ABI: %w", err)
 	}
 	topic := parsedABI.Events["Deposited"].ID
 
-	listenEvents(ctx, l.client, "deposited", l.contractAddr, l.confirmationBlocks, l.pollInterval, fromBlock, fromLogIndex,
+	return listenEvents(ctx, l.client, "deposited", l.contractAddr, l.confirmationBlocks, l.pollInterval, fromBlock, fromLogIndex,
 		[][]common.Hash{{topic}},
 		func(log types.Log) {
 			ev, err := l.depositFilterer.ParseDeposited(log)
@@ -161,6 +164,9 @@ func (l *Listener) WatchDeposited(ctx context.Context, sink chan<- *DepositedEve
 	)
 }
 
+// ErrBackoffLimitReached is returned when the listener exhausts its backoff retry budget.
+var ErrBackoffLimitReached = errors.New("backoff limit reached")
+
 // listenEvents polls for new confirmed blocks at pollInterval and only
 // processes events from blocks that have at least confirmationBlocks on top.
 type logHandler func(log types.Log)
@@ -176,7 +182,7 @@ func listenEvents(
 	lastIndex uint32,
 	topics [][]common.Hash,
 	handler logHandler,
-) {
+) error {
 	var backOffCount atomic.Uint64
 
 	listenerLogger.Debugw("starting confirmed-block polling", "subID", subID, "confirmationBlocks", confirmationBlocks, "pollInterval", pollInterval)
@@ -188,12 +194,15 @@ func listenEvents(
 		select {
 		case <-ctx.Done():
 			listenerLogger.Infow("context cancelled, stopping listener", "subID", subID)
-			return
+			return nil
 		case <-ticker.C:
 		}
 
 		if !waitForBackOffTimeout(ctx, int(backOffCount.Load()), "confirmed-block poll") {
-			return
+			if ctx.Err() != nil {
+				return nil
+			}
+			return fmt.Errorf("%w: listener %s failed after %d consecutive errors", ErrBackoffLimitReached, subID, backOffCount.Load())
 		}
 
 		headerCtx, cancel := context.WithTimeout(ctx, 1*time.Minute)
@@ -206,7 +215,7 @@ func listenEvents(
 		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
-				return
+				return nil
 			}
 			listenerLogger.Errorw("failed to get latest block", "error", err, "subID", subID)
 			backOffCount.Add(1)

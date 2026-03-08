@@ -52,6 +52,12 @@ func main() {
 		}
 	}
 
+	// Configure global slog default to match the service log level.
+	logLevel := conf.SlogLevel()
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: logLevel,
+	})))
+
 	svc, err := service.New(*conf)
 	if err != nil {
 		slog.Error("Failed to create service", "error", err)

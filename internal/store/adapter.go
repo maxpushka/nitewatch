@@ -50,6 +50,18 @@ type PendingRejectionModel struct {
 	WithdrawalID string    `gorm:"type:varchar(66);not null;uniqueIndex"`
 	Reason       string    `gorm:"type:text;not null;default:''"`
 	Completed    bool      `gorm:"not null;default:false"`
+	RetryCount   int       `gorm:"not null;default:0"`
+	CreatedAt    time.Time `gorm:"not null;autoCreateTime"`
+}
+
+type PendingFinalizationModel struct {
+	ID           uint64    `gorm:"primaryKey;autoIncrement"`
+	WithdrawalID string    `gorm:"type:varchar(66);not null;uniqueIndex"`
+	UserAddress  string    `gorm:"type:varchar(42);not null"`
+	TokenAddress string    `gorm:"type:varchar(42);not null"`
+	Amount       string    `gorm:"type:text;not null"`
+	Completed    bool      `gorm:"not null;default:false"`
+	RetryCount   int       `gorm:"not null;default:0"`
 	CreatedAt    time.Time `gorm:"not null;autoCreateTime"`
 }
 
@@ -58,7 +70,7 @@ type Adapter struct {
 }
 
 func NewAdapter(db *gorm.DB) (*Adapter, error) {
-	if err := db.AutoMigrate(&WithdrawalModel{}, &BlockCursorModel{}, &WithdrawEventModel{}, &PendingRejectionModel{}); err != nil {
+	if err := db.AutoMigrate(&WithdrawalModel{}, &BlockCursorModel{}, &WithdrawEventModel{}, &PendingRejectionModel{}, &PendingFinalizationModel{}); err != nil {
 		return nil, err
 	}
 	return &Adapter{db: db}, nil
@@ -151,6 +163,54 @@ func (a *Adapter) CompletePendingRejection(withdrawalID string) error {
 	return a.db.Model(&PendingRejectionModel{}).
 		Where("withdrawal_id = ?", withdrawalID).
 		Update("completed", true).Error
+}
+
+func (a *Adapter) IncrementRejectionRetry(withdrawalID string) error {
+	return a.db.Model(&PendingRejectionModel{}).
+		Where("withdrawal_id = ?", withdrawalID).
+		UpdateColumn("retry_count", gorm.Expr("retry_count + 1")).Error
+}
+
+func (a *Adapter) SavePendingFinalization(p *PendingFinalizationModel) error {
+	return a.db.Clauses(clause.OnConflict{DoNothing: true}).Create(p).Error
+}
+
+func (a *Adapter) GetPendingFinalizations() ([]PendingFinalizationModel, error) {
+	var pending []PendingFinalizationModel
+	if err := a.db.Where("completed = ?", false).Find(&pending).Error; err != nil {
+		return nil, err
+	}
+	return pending, nil
+}
+
+func (a *Adapter) CompletePendingFinalization(withdrawalID string) error {
+	return a.db.Model(&PendingFinalizationModel{}).
+		Where("withdrawal_id = ?", withdrawalID).
+		Update("completed", true).Error
+}
+
+func (a *Adapter) IncrementFinalizationRetry(withdrawalID string) error {
+	return a.db.Model(&PendingFinalizationModel{}).
+		Where("withdrawal_id = ?", withdrawalID).
+		UpdateColumn("retry_count", gorm.Expr("retry_count + 1")).Error
+}
+
+// RecordWithdrawEventOnly records an event without advancing the cursor.
+// Used for recoverable errors so the event can be re-processed on restart.
+func (a *Adapter) RecordWithdrawEventOnly(ev *WithdrawEventModel) error {
+	return a.db.Clauses(clause.OnConflict{DoNothing: true}).Create(ev).Error
+}
+
+// UpdateWithdrawEventDecision updates the decision and reason on an existing event record.
+func (a *Adapter) UpdateWithdrawEventDecision(withdrawalID, decision, reason string) error {
+	return a.db.Model(&WithdrawEventModel{}).
+		Where("withdrawal_id = ?", withdrawalID).
+		Updates(map[string]interface{}{"decision": decision, "reason": reason}).Error
+}
+
+// UpsertFinalizedCursor updates the cursor for the withdraw_finalized stream.
+func (a *Adapter) UpsertFinalizedCursor(blockNumber uint64, logIndex uint) error {
+	return upsertCursor(a.db, "withdraw_finalized", blockNumber, logIndex)
 }
 
 func upsertCursor(tx *gorm.DB, streamName string, blockNumber uint64, logIndex uint) error {

@@ -62,10 +62,11 @@ type Custody interface {
 // EventListener defines the ability to subscribe to custody contract events.
 // Each method blocks until the context is cancelled; callers should run them in goroutines.
 // The sink channel is closed when the method returns.
+// Methods return an error if the listener stops unexpectedly (e.g. backoff limit).
 type EventListener interface {
-	WatchWithdrawStarted(ctx context.Context, sink chan<- *WithdrawStartedEvent, fromBlock uint64, fromLogIndex uint32)
-	WatchWithdrawFinalized(ctx context.Context, sink chan<- *WithdrawFinalizedEvent, fromBlock uint64, fromLogIndex uint32)
-	WatchDeposited(ctx context.Context, sink chan<- *DepositedEvent, fromBlock uint64, fromLogIndex uint32)
+	WatchWithdrawStarted(ctx context.Context, sink chan<- *WithdrawStartedEvent, fromBlock uint64, fromLogIndex uint32) error
+	WatchWithdrawFinalized(ctx context.Context, sink chan<- *WithdrawFinalizedEvent, fromBlock uint64, fromLogIndex uint32) error
+	WatchDeposited(ctx context.Context, sink chan<- *DepositedEvent, fromBlock uint64, fromLogIndex uint32) error
 }
 
 // WithdrawalStore defines the storage operations for tracking withdrawals.

@@ -4,6 +4,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/big"
 	"os"
 	"strings"
@@ -22,6 +23,22 @@ type Config struct {
 	PerUserOverrides map[string]LimitsConfig `yaml:"per_user_overrides"`
 	ListenAddr       string                  `yaml:"listen_addr"`
 	DBPath           string                  `yaml:"db_path"`
+	LogLevel         string                  `yaml:"log_level"`
+}
+
+// SlogLevel parses the configured log level string into an slog.Level.
+// Supported values: DEBUG, INFO (default), WARN, ERROR.
+func (c Config) SlogLevel() slog.Level {
+	switch strings.ToUpper(c.LogLevel) {
+	case "DEBUG":
+		return slog.LevelDebug
+	case "WARN", "WARNING":
+		return slog.LevelWarn
+	case "ERROR":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 type BlockchainConfig struct {

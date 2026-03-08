@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -40,6 +41,13 @@ import (
 // headroom.
 const gasEstimateBufferPercent = 75
 
+// txMiningTimeout is the maximum time to wait for a transaction to be mined.
+const txMiningTimeout = 5 * time.Minute
+
+// maxDeferredRetries is the maximum number of retry attempts for deferred
+// rejections and finalizations before marking them as permanently failed.
+const maxDeferredRetries = 25
+
 type httpServer struct {
 	Engine *gin.Engine
 	server *http.Server
@@ -69,6 +77,9 @@ type Service struct {
 	checker   *checker.Checker
 	store     *store.Adapter
 
+	// txMu serializes transaction submissions to prevent nonce contention.
+	txMu sync.Mutex
+
 	workerReady int32
 }
 
@@ -94,7 +105,12 @@ func NewWithBackend(conf config.Config, client custody.EthBackend) (*Service, er
 		return nil, fmt.Errorf("confirmation_blocks must be > 0")
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, nil)).With("service", "nitewatch")
+	logLevel := conf.SlogLevel()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: logLevel,
+	})).With("service", "nitewatch")
+
+	logger.Info("Logger initialized", "level", logLevel.String())
 
 	srv := newHTTPServer(conf.ListenAddr)
 
@@ -188,11 +204,11 @@ func (svc *Service) RunWorkerWithContext(ctx context.Context) error {
 		return svc.web.Run()
 	})
 
+	// Watch WithdrawStarted events and process them.
 	g.Go(func() error {
 		fromBlock, fromLogIdx, err := svc.store.GetCursor("withdraw_started")
 		if err != nil {
 			svc.Logger.Warn("Failed to read withdraw_started cursor, starting from head", "error", err)
-			// If cursor is missing, we default to 0. But if StartBlock is configured, we should use that.
 		}
 		if fromBlock == 0 && svc.Config.Blockchain.StartBlock > 0 {
 			fromBlock = svc.Config.Blockchain.StartBlock
@@ -200,15 +216,58 @@ func (svc *Service) RunWorkerWithContext(ctx context.Context) error {
 
 		svc.Logger.Info("Starting WithdrawStarted event watcher", "from_block", fromBlock, "from_log_index", fromLogIdx)
 		withdrawals := make(chan *custody.WithdrawStartedEvent)
-		go svc.listener.WatchWithdrawStarted(ctx, withdrawals, fromBlock, fromLogIdx)
+
+		// Capture listener error from goroutine.
+		listenerErrCh := make(chan error, 1)
+		go func() {
+			listenerErrCh <- svc.listener.WatchWithdrawStarted(ctx, withdrawals, fromBlock, fromLogIdx)
+		}()
+
 		for event := range withdrawals {
 			svc.processWithdrawal(ctx, event)
+		}
+
+		// Channel closed — check if it was a listener error or context cancellation.
+		if err := <-listenerErrCh; err != nil {
+			svc.Logger.Error("WithdrawStarted listener failed", "error", err)
+			return fmt.Errorf("withdraw_started listener: %w", err)
 		}
 		return nil
 	})
 
+	// Watch WithdrawFinalized events to track all finalized withdrawals
+	// (including those triggered by other signers) for accurate rate limiting.
 	g.Go(func() error {
-		svc.Logger.Info("Starting deferred rejection processor")
+		fromBlock, fromLogIdx, err := svc.store.GetCursor("withdraw_finalized")
+		if err != nil {
+			svc.Logger.Warn("Failed to read withdraw_finalized cursor, starting from head", "error", err)
+		}
+		if fromBlock == 0 && svc.Config.Blockchain.StartBlock > 0 {
+			fromBlock = svc.Config.Blockchain.StartBlock
+		}
+
+		svc.Logger.Info("Starting WithdrawFinalized event watcher", "from_block", fromBlock, "from_log_index", fromLogIdx)
+		finalized := make(chan *custody.WithdrawFinalizedEvent)
+
+		listenerErrCh := make(chan error, 1)
+		go func() {
+			listenerErrCh <- svc.listener.WatchWithdrawFinalized(ctx, finalized, fromBlock, fromLogIdx)
+		}()
+
+		for event := range finalized {
+			svc.processFinalized(ctx, event)
+		}
+
+		if err := <-listenerErrCh; err != nil {
+			svc.Logger.Error("WithdrawFinalized listener failed", "error", err)
+			return fmt.Errorf("withdraw_finalized listener: %w", err)
+		}
+		return nil
+	})
+
+	// Process deferred rejections and finalizations.
+	g.Go(func() error {
+		svc.Logger.Info("Starting deferred processor")
 		ticker := time.NewTicker(5 * time.Minute)
 		defer ticker.Stop()
 		for {
@@ -217,6 +276,7 @@ func (svc *Service) RunWorkerWithContext(ctx context.Context) error {
 				return nil
 			case <-ticker.C:
 				svc.processDeferredRejections(ctx)
+				svc.processDeferredFinalizations(ctx)
 			}
 		}
 	})
@@ -242,12 +302,26 @@ func (svc *Service) RunWorkerWithContext(ctx context.Context) error {
 	return g.Wait()
 }
 
+// sendTx serializes transaction submission through txMu to prevent nonce contention.
+func (svc *Service) sendTx(ctx context.Context, send func(auth *bind.TransactOpts) (*types.Transaction, error)) (*types.Transaction, error) {
+	svc.txMu.Lock()
+	defer svc.txMu.Unlock()
+
+	txAuth := *svc.auth
+	txAuth.Context = ctx
+	return send(&txAuth)
+}
+
+// waitMined waits for a transaction to be mined with a timeout.
+func (svc *Service) waitMined(ctx context.Context, tx *types.Transaction) (*types.Receipt, error) {
+	mineCtx, cancel := context.WithTimeout(ctx, txMiningTimeout)
+	defer cancel()
+	return bind.WaitMined(mineCtx, svc.ethClient, tx)
+}
+
 // finalizeWithdrawWithGasBuffer sends a FinalizeWithdraw transaction with a
 // gas limit buffer above the eth_estimateGas result. This prevents "out of
-// gas" reverts when on-chain state changes between estimation and mining:
-// e.g. another signer's approval lands first, causing this transaction to
-// trigger _executeWithdrawal (ERC20/ETH transfer), a more expensive code
-// path than the one estimated.
+// gas" reverts when on-chain state changes between estimation and mining.
 func (svc *Service) finalizeWithdrawWithGasBuffer(txAuth *bind.TransactOpts, withdrawalID [32]byte) (*types.Transaction, error) {
 	dryRun := *txAuth
 	dryRun.NoSend = true
@@ -282,7 +356,7 @@ func (svc *Service) processWithdrawal(ctx context.Context, event *custody.Withdr
 	)
 
 	if svc.store.HasWithdrawEvent(wID) {
-		logger.Info("Event already processed, skipping")
+		logger.Debug("Event already processed, skipping")
 		return
 	}
 
@@ -301,9 +375,9 @@ func (svc *Service) processWithdrawal(ctx context.Context, event *custody.Withdr
 	if err := svc.checker.Check(event.User, event.Token, event.Amount); err != nil {
 		logger.Warn("Withdrawal blocked by policy, rejecting", "reason", err)
 
-		txAuth := *svc.auth
-		txAuth.Context = ctx
-		tx, txErr := svc.rejectWithdrawWithGasBuffer(&txAuth, event.WithdrawalID)
+		tx, txErr := svc.sendTx(ctx, func(auth *bind.TransactOpts) (*types.Transaction, error) {
+			return svc.rejectWithdrawWithGasBuffer(auth, event.WithdrawalID)
+		})
 		if txErr != nil {
 			// Rejection may fail if the contract requires expiry (ThresholdCustody).
 			// Schedule a deferred retry.
@@ -322,7 +396,7 @@ func (svc *Service) processWithdrawal(ctx context.Context, event *custody.Withdr
 		}
 
 		logger.Info("Sent reject transaction", "tx_hash", tx.Hash().Hex())
-		receipt, txErr := bind.WaitMined(ctx, svc.ethClient, tx)
+		receipt, txErr := svc.waitMined(ctx, tx)
 		if txErr != nil {
 			logger.Error("Failed waiting for reject tx to be mined", "error", txErr)
 			baseModel.Decision = "error"
@@ -351,26 +425,50 @@ func (svc *Service) processWithdrawal(ctx context.Context, event *custody.Withdr
 		return
 	}
 
-	txAuth := *svc.auth
-	txAuth.Context = ctx
-
-	tx, err := svc.finalizeWithdrawWithGasBuffer(&txAuth, event.WithdrawalID)
+	tx, err := svc.sendTx(ctx, func(auth *bind.TransactOpts) (*types.Transaction, error) {
+		return svc.finalizeWithdrawWithGasBuffer(auth, event.WithdrawalID)
+	})
 	if err != nil {
 		logger.Error("Failed to finalize withdrawal", "error", err)
 		baseModel.Decision = "error"
 		baseModel.Reason = fmt.Sprintf("finalize tx failed: %v", err)
-		svc.recordEvent(logger, &baseModel)
+
+		// Schedule a deferred retry for the finalization.
+		pending := &store.PendingFinalizationModel{
+			WithdrawalID: wID,
+			UserAddress:  event.User.Hex(),
+			TokenAddress: event.Token.Hex(),
+			Amount:       event.Amount.String(),
+		}
+		if dbErr := svc.store.SavePendingFinalization(pending); dbErr != nil {
+			logger.Error("Failed to save pending finalization", "error", dbErr)
+		}
+
+		// Record without advancing cursor so re-processing is possible.
+		svc.recordEventRecoverable(logger, &baseModel)
 		return
 	}
 
 	logger.Info("Sent finalize transaction", "tx_hash", tx.Hash().Hex())
 
-	receipt, err := bind.WaitMined(ctx, svc.ethClient, tx)
+	receipt, err := svc.waitMined(ctx, tx)
 	if err != nil {
 		logger.Error("Transaction mining failed", "error", err)
 		baseModel.Decision = "error"
 		baseModel.Reason = fmt.Sprintf("finalize tx mining failed: %v", err)
-		svc.recordEvent(logger, &baseModel)
+
+		// Schedule a deferred retry.
+		pending := &store.PendingFinalizationModel{
+			WithdrawalID: wID,
+			UserAddress:  event.User.Hex(),
+			TokenAddress: event.Token.Hex(),
+			Amount:       event.Amount.String(),
+		}
+		if dbErr := svc.store.SavePendingFinalization(pending); dbErr != nil {
+			logger.Error("Failed to save pending finalization", "error", dbErr)
+		}
+
+		svc.recordEventRecoverable(logger, &baseModel)
 		return
 	}
 
@@ -378,7 +476,19 @@ func (svc *Service) processWithdrawal(ctx context.Context, event *custody.Withdr
 		logger.Error("Withdrawal finalization tx reverted")
 		baseModel.Decision = "error"
 		baseModel.Reason = "finalize tx reverted on-chain"
-		svc.recordEvent(logger, &baseModel)
+
+		// Schedule retry — may have been a transient state issue.
+		pending := &store.PendingFinalizationModel{
+			WithdrawalID: wID,
+			UserAddress:  event.User.Hex(),
+			TokenAddress: event.Token.Hex(),
+			Amount:       event.Amount.String(),
+		}
+		if dbErr := svc.store.SavePendingFinalization(pending); dbErr != nil {
+			logger.Error("Failed to save pending finalization", "error", dbErr)
+		}
+
+		svc.recordEventRecoverable(logger, &baseModel)
 		return
 	}
 
@@ -423,6 +533,47 @@ func (svc *Service) processWithdrawal(ctx context.Context, event *custody.Withdr
 	}
 }
 
+// processFinalized handles WithdrawFinalized events from any signer.
+// This ensures the local DB accurately tracks all finalized withdrawals
+// for rate limiting, and cleans up stale deferred rejections.
+func (svc *Service) processFinalized(_ context.Context, event *custody.WithdrawFinalizedEvent) {
+	wID := common.Hash(event.WithdrawalID).Hex()
+	logger := svc.Logger.With("withdrawal_id", wID, "success", event.Success)
+
+	logger.Debug("Processing WithdrawFinalized event")
+
+	// Cancel any pending deferred rejection for this withdrawal.
+	if err := svc.store.CompletePendingRejection(wID); err != nil {
+		logger.Debug("No pending rejection to cancel", "error", err)
+	}
+
+	// Cancel any pending deferred finalization.
+	if err := svc.store.CompletePendingFinalization(wID); err != nil {
+		logger.Debug("No pending finalization to cancel", "error", err)
+	}
+
+	// If the withdrawal was finalized successfully and we had it as pending,
+	// update the event decision.
+	if event.Success {
+		if err := svc.store.UpdateWithdrawEventDecision(wID, "approved", "finalized by quorum"); err != nil {
+			logger.Debug("No pending event to update", "error", err)
+		}
+	}
+
+	// Update cursor for withdraw_finalized stream.
+	ev := &store.WithdrawEventModel{
+		WithdrawalID: wID,
+		BlockNumber:  event.BlockNumber,
+		TxHash:       event.TxHash.Hex(),
+		LogIndex:     event.LogIndex,
+	}
+	// Use a separate cursor for this stream via a direct upsert.
+	if err := svc.store.UpsertFinalizedCursor(event.BlockNumber, event.LogIndex); err != nil {
+		logger.Error("Failed to update withdraw_finalized cursor", "error", err)
+	}
+	_ = ev // cursor updated above
+}
+
 func (svc *Service) processDeferredRejections(ctx context.Context) {
 	pending, err := svc.store.GetPendingRejections()
 	if err != nil {
@@ -431,24 +582,38 @@ func (svc *Service) processDeferredRejections(ctx context.Context) {
 	}
 
 	for _, p := range pending {
-		logger := svc.Logger.With("withdrawal_id", p.WithdrawalID, "reason", p.Reason)
+		logger := svc.Logger.With("withdrawal_id", p.WithdrawalID, "reason", p.Reason, "retry_count", p.RetryCount)
+
+		if p.RetryCount >= maxDeferredRetries {
+			logger.Error("Deferred rejection exceeded max retries, marking completed")
+			if err := svc.store.CompletePendingRejection(p.WithdrawalID); err != nil {
+				logger.Error("Failed to mark pending rejection as completed", "error", err)
+			}
+			continue
+		}
 
 		var wID [32]byte
 		copy(wID[:], common.FromHex(p.WithdrawalID))
 
-		txAuth := *svc.auth
-		txAuth.Context = ctx
-		tx, txErr := svc.rejectWithdrawWithGasBuffer(&txAuth, wID)
+		tx, txErr := svc.sendTx(ctx, func(auth *bind.TransactOpts) (*types.Transaction, error) {
+			return svc.rejectWithdrawWithGasBuffer(auth, wID)
+		})
 		if txErr != nil {
-			// Will retry on next tick; may still be before expiry
-			logger.Warn("Deferred reject tx failed (may not be expired yet)", "error", txErr)
+			// Will retry on next tick; may still be before expiry or already finalized.
+			logger.Debug("Deferred reject tx failed (may not be expired yet)", "error", txErr)
+			if err := svc.store.IncrementRejectionRetry(p.WithdrawalID); err != nil {
+				logger.Error("Failed to increment rejection retry count", "error", err)
+			}
 			continue
 		}
 
 		logger.Info("Sent deferred reject transaction", "tx_hash", tx.Hash().Hex())
-		receipt, txErr := bind.WaitMined(ctx, svc.ethClient, tx)
+		receipt, txErr := svc.waitMined(ctx, tx)
 		if txErr != nil {
 			logger.Error("Deferred reject tx mining failed", "error", txErr)
+			if err := svc.store.IncrementRejectionRetry(p.WithdrawalID); err != nil {
+				logger.Error("Failed to increment rejection retry count", "error", err)
+			}
 			continue
 		}
 
@@ -464,8 +629,114 @@ func (svc *Service) processDeferredRejections(ctx context.Context) {
 	}
 }
 
+// processDeferredFinalizations retries failed finalization attempts.
+func (svc *Service) processDeferredFinalizations(ctx context.Context) {
+	pending, err := svc.store.GetPendingFinalizations()
+	if err != nil {
+		svc.Logger.Error("Failed to get pending finalizations", "error", err)
+		return
+	}
+
+	for _, p := range pending {
+		logger := svc.Logger.With("withdrawal_id", p.WithdrawalID, "retry_count", p.RetryCount)
+
+		if p.RetryCount >= maxDeferredRetries {
+			logger.Error("Deferred finalization exceeded max retries, marking completed")
+			if err := svc.store.CompletePendingFinalization(p.WithdrawalID); err != nil {
+				logger.Error("Failed to mark pending finalization as completed", "error", err)
+			}
+			continue
+		}
+
+		var wID [32]byte
+		copy(wID[:], common.FromHex(p.WithdrawalID))
+
+		tx, txErr := svc.sendTx(ctx, func(auth *bind.TransactOpts) (*types.Transaction, error) {
+			return svc.finalizeWithdrawWithGasBuffer(auth, wID)
+		})
+		if txErr != nil {
+			if isContractRevert(txErr) {
+				// Contract reverted — withdrawal may already be finalized or expired.
+				logger.Info("Deferred finalization reverted, marking completed", "error", txErr)
+				if err := svc.store.CompletePendingFinalization(p.WithdrawalID); err != nil {
+					logger.Error("Failed to mark pending finalization as completed", "error", err)
+				}
+				continue
+			}
+			logger.Warn("Deferred finalize tx failed", "error", txErr)
+			if err := svc.store.IncrementFinalizationRetry(p.WithdrawalID); err != nil {
+				logger.Error("Failed to increment finalization retry count", "error", err)
+			}
+			continue
+		}
+
+		logger.Info("Sent deferred finalize transaction", "tx_hash", tx.Hash().Hex())
+		receipt, txErr := svc.waitMined(ctx, tx)
+		if txErr != nil {
+			logger.Error("Deferred finalize tx mining failed", "error", txErr)
+			if err := svc.store.IncrementFinalizationRetry(p.WithdrawalID); err != nil {
+				logger.Error("Failed to increment finalization retry count", "error", err)
+			}
+			continue
+		}
+
+		if receipt.Status == 1 {
+			logger.Info("Deferred finalization succeeded on-chain")
+
+			// Check if this tx actually triggered the withdrawal execution.
+			for _, log := range receipt.Logs {
+				finalized, parseErr := svc.contract.ParseWithdrawFinalized(*log)
+				if parseErr != nil {
+					continue
+				}
+				if finalized.WithdrawalId == wID && finalized.Success {
+					amount, ok := new(big.Int).SetString(p.Amount, 10)
+					if ok {
+						record := &custody.Withdrawal{
+							WithdrawalID: wID,
+							User:         common.HexToAddress(p.UserAddress),
+							Token:        common.HexToAddress(p.TokenAddress),
+							Amount:       amount,
+							BlockNumber:  receipt.BlockNumber.Uint64(),
+							TxHash:       tx.Hash(),
+							Timestamp:    time.Now(),
+						}
+						if err := svc.checker.Record(record); err != nil {
+							logger.Error("Failed to record withdrawal in DB", "error", err)
+						}
+					}
+					break
+				}
+			}
+
+			// Update the event record if it exists.
+			if err := svc.store.UpdateWithdrawEventDecision(p.WithdrawalID, "approved", "deferred finalization succeeded"); err != nil {
+				logger.Debug("No event to update for deferred finalization", "error", err)
+			}
+		} else {
+			logger.Warn("Deferred finalization tx reverted on-chain")
+			if err := svc.store.IncrementFinalizationRetry(p.WithdrawalID); err != nil {
+				logger.Error("Failed to increment finalization retry count", "error", err)
+			}
+			continue
+		}
+
+		if err := svc.store.CompletePendingFinalization(p.WithdrawalID); err != nil {
+			logger.Error("Failed to mark pending finalization as completed", "error", err)
+		}
+	}
+}
+
 func (svc *Service) recordEvent(logger *slog.Logger, ev *store.WithdrawEventModel) {
 	if err := svc.store.RecordWithdrawEvent(ev); err != nil {
+		logger.Error("Failed to record withdraw event", "error", err)
+	}
+}
+
+// recordEventRecoverable records the event without advancing the cursor,
+// allowing re-processing on restart for recoverable errors.
+func (svc *Service) recordEventRecoverable(logger *slog.Logger, ev *store.WithdrawEventModel) {
+	if err := svc.store.RecordWithdrawEventOnly(ev); err != nil {
 		logger.Error("Failed to record withdraw event", "error", err)
 	}
 }
