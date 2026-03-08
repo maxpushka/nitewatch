@@ -76,25 +76,125 @@ sequenceDiagram
 
 ## Usage
 
+### Building from source
+
+```bash
+go build -ldflags "-X github.com/layer-3/nitewatch.Version=v1.0.0" -o nitewatch ./cmd/nitewatch
+```
+
 ### Running the daemon
 
 ```bash
 nitewatch worker
 ```
 
-### Checking the version
+The daemon starts the security policy engine, event listeners, and the health endpoint. Configuration is loaded from environment variables or a YAML file (see [Configuration](#configuration)).
+
+### CLI reference
+
+The `nitewatch` binary doubles as an operations CLI for deploying contracts, submitting transactions, querying on-chain state, and inspecting the local database.
+
+#### Service
+
+| Command | Description |
+|---------|-------------|
+| `nitewatch worker` | Run the nitewatch daemon |
+| `nitewatch version` | Print build version (`dev` if unset) |
+
+#### Contract deployment
 
 ```bash
-nitewatch version
+nitewatch deploy \
+    --rpc http://127.0.0.1:8545 \
+    --key 0xACCOUNT_PRIVATE_KEY \
+    --signers 0xSIGNER1,0xSIGNER2,0xSIGNER3 \
+    --threshold 2
 ```
 
-The version is set at build time via ldflags. Dev builds print `dev`.
+Deploys a new `ThresholdCustody` contract. Prints the contract address on success.
 
-### Building from source
+#### Contract write operations
+
+All write commands require `--rpc`, `--contract`, and `--key`.
 
 ```bash
-go build -ldflags "-X github.com/layer-3/nitewatch.Version=v1.0.0" ./cmd/nitewatch
+# Deposit native ETH
+nitewatch deposit --rpc $RPC --contract $ADDR --key $KEY --amount 1000000000000000000
+
+# Deposit ERC20
+nitewatch deposit --rpc $RPC --contract $ADDR --key $KEY --amount 1000000 --token 0xUSDT
+
+# Start a withdrawal (caller must be a signer)
+nitewatch start-withdraw --rpc $RPC --contract $ADDR --key $KEY \
+    --user 0xUSER --amount 500000000000000000 --nonce 1 [--token 0xTOKEN]
+
+# Approve / finalize a withdrawal (caller must be a signer)
+nitewatch finalize --rpc $RPC --contract $ADDR --key $KEY --id 0xWITHDRAWAL_ID
+
+# Reject an expired withdrawal
+nitewatch reject --rpc $RPC --contract $ADDR --key $KEY --id 0xWITHDRAWAL_ID
 ```
+
+`finalize` prints whether the threshold was met and the withdrawal executed, or if the approval was merely recorded.
+
+#### Contract read operations
+
+Read commands require `--rpc` and `--contract` only.
+
+```bash
+# Contract summary (threshold, signer count, chain ID)
+nitewatch info --rpc $RPC --contract $ADDR
+
+# Inspect a withdrawal by ID
+nitewatch withdrawal --rpc $RPC --contract $ADDR --id 0xWITHDRAWAL_ID
+
+# Contract ETH balance
+nitewatch balance --rpc $RPC --contract $ADDR
+
+# Contract ERC20 balance
+nitewatch balance --rpc $RPC --contract $ADDR --token 0xUSDT
+
+# List all signers
+nitewatch signers --rpc $RPC --contract $ADDR
+
+# Check if an address is a signer (exits 1 if not)
+nitewatch is-signer --rpc $RPC --contract $ADDR --address 0xADDRESS
+
+# Rate limit parameters (bucket capacity, refill interval, available tokens)
+nitewatch rate-limit --rpc $RPC --contract $ADDR
+
+# List WithdrawStarted and WithdrawFinalized events
+nitewatch events --rpc $RPC --contract $ADDR [--from BLOCK_NUMBER]
+```
+
+#### Database helpers
+
+Inspect the local SQLite database used by the daemon. Requires `--db`.
+
+```bash
+# List recorded withdrawals (most recent first)
+nitewatch db withdrawals --db nitewatch.db
+
+# Show event listener cursors (block number / log index per stream)
+nitewatch db cursors --db nitewatch.db
+
+# List withdraw event decisions (approved, rejected, error, pending)
+nitewatch db events --db nitewatch.db
+
+# Show pending deferred rejections and finalizations
+nitewatch db pending --db nitewatch.db
+```
+
+### E2E devnet test
+
+A self-contained end-to-end test deploys `ThresholdCustody` on Anvil and exercises the full withdrawal flow using the CLI:
+
+```bash
+# Requires: anvil (foundry), go
+./test/test-threshold-devnet.sh
+```
+
+The script starts Anvil, deploys a 2-of-3 contract, deposits ETH, runs the withdrawal happy path, verifies rejection rules, and checks double-finalize protection.
 
 ### Docker
 
