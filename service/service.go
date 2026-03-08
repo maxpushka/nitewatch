@@ -31,16 +31,6 @@ import (
 	"github.com/layer-3/nitewatch/internal/store"
 )
 
-// gasEstimateBufferPercent is applied on top of eth_estimateGas results.
-// The EVM's 63/64 gas rule (EIP-150) for CALL instructions means the minimum
-// gas *limit* can be significantly higher than the gas *consumed*. When
-// on-chain state changes between estimation and mining (e.g., another signer's
-// approval shifts finalizeWithdraw from the "record approval" path into the
-// "execute withdrawal + ETH/ERC20 transfer" path), the gas deficit can reach
-// ~33% for ETH and ~67% for ERC20 transfers. A 75% buffer covers both with
-// headroom.
-const gasEstimateBufferPercent = 75
-
 // txMiningTimeout is the maximum time to wait for a transaction to be mined.
 const txMiningTimeout = 5 * time.Minute
 
@@ -330,31 +320,12 @@ func (svc *Service) waitMined(ctx context.Context, tx *types.Transaction) (*type
 	return bind.WaitMined(mineCtx, svc.ethClient, tx)
 }
 
-// finalizeWithdrawWithGasBuffer sends a FinalizeWithdraw transaction with a
-// gas limit buffer above the eth_estimateGas result. This prevents "out of
-// gas" reverts when on-chain state changes between estimation and mining.
 func (svc *Service) finalizeWithdrawWithGasBuffer(txAuth *bind.TransactOpts, withdrawalID [32]byte) (*types.Transaction, error) {
-	dryRun := *txAuth
-	dryRun.NoSend = true
-	estTx, err := svc.contract.FinalizeWithdraw(&dryRun, withdrawalID)
-	if err != nil {
-		return nil, err
-	}
-	txAuth.GasLimit = estTx.Gas() * (100 + gasEstimateBufferPercent) / 100
-	return svc.contract.FinalizeWithdraw(txAuth, withdrawalID)
+	return custody.FinalizeWithdrawWithGasBuffer(txAuth, svc.contract, svc.ethClient, withdrawalID)
 }
 
-// rejectWithdrawWithGasBuffer sends a RejectWithdraw transaction with a gas
-// limit buffer. See finalizeWithdrawWithGasBuffer for rationale.
 func (svc *Service) rejectWithdrawWithGasBuffer(txAuth *bind.TransactOpts, withdrawalID [32]byte) (*types.Transaction, error) {
-	dryRun := *txAuth
-	dryRun.NoSend = true
-	estTx, err := svc.contract.RejectWithdraw(&dryRun, withdrawalID)
-	if err != nil {
-		return nil, err
-	}
-	txAuth.GasLimit = estTx.Gas() * (100 + gasEstimateBufferPercent) / 100
-	return svc.contract.RejectWithdraw(txAuth, withdrawalID)
+	return custody.RejectWithdrawWithGasBuffer(txAuth, svc.contract, svc.ethClient, withdrawalID)
 }
 
 func (svc *Service) processWithdrawal(ctx context.Context, event *custody.WithdrawStartedEvent) {
