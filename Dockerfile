@@ -7,8 +7,11 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 
+ARG VERSION=dev
+
 COPY . .
-RUN go build -o /usr/local/bin/nitewatch ./cmd/nitewatch
+RUN go build -ldflags "-X github.com/layer-3/nitewatch.Version=${VERSION}" \
+    -o /usr/local/bin/nitewatch ./cmd/nitewatch
 
 EXPOSE 8080
 

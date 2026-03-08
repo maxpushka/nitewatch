@@ -9,13 +9,25 @@ import (
 
 	"golang.org/x/term"
 
+	nitewatch "github.com/layer-3/nitewatch"
 	"github.com/layer-3/nitewatch/config"
 	"github.com/layer-3/nitewatch/service"
 )
 
 func main() {
-	if len(os.Args) < 2 || os.Args[1] != "worker" {
-		fmt.Fprintln(os.Stderr, "usage: nitewatch worker")
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: nitewatch <worker|version>")
+		os.Exit(1)
+	}
+
+	switch os.Args[1] {
+	case "version":
+		fmt.Println(nitewatch.Version)
+		return
+	case "worker":
+		// handled below
+	default:
+		fmt.Fprintln(os.Stderr, "usage: nitewatch <worker|version>")
 		os.Exit(1)
 	}
 
