@@ -1,6 +1,7 @@
 package config
 
 import (
+	_ "embed"
 	"errors"
 	"fmt"
 	"math/big"
@@ -11,6 +12,9 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"gopkg.in/yaml.v3"
 )
+
+//go:embed config.yaml
+var DefaultConfig []byte
 
 type Config struct {
 	Blockchain       BlockchainConfig        `yaml:"blockchain"`

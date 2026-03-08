@@ -68,9 +68,8 @@ func loadConfig() (*config.Config, error) {
 	if raw := os.Getenv("NITEWATCH_CONFIG"); raw != "" {
 		return config.LoadFromEnv(raw)
 	}
-	configPath := os.Getenv("NITEWATCH_CONFIG_PATH")
-	if configPath == "" {
-		configPath = "config.yaml"
+	if configPath := os.Getenv("NITEWATCH_CONFIG_PATH"); configPath != "" {
+		return config.Load(configPath)
 	}
-	return config.Load(configPath)
+	return config.LoadFromEnv(string(config.DefaultConfig))
 }
