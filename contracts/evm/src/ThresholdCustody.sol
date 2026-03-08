@@ -90,9 +90,7 @@ contract ThresholdCustody is IWithdraw, IDeposit, ReentrancyGuard, EIP712, Multi
 
     function setThreshold(uint64 newThreshold, uint256 deadline, bytes calldata signatures) external {
         _verifyQuorumOp(
-            keccak256(abi.encode(SET_THRESHOLD_TYPEHASH, newThreshold, signerNonce, deadline)),
-            deadline,
-            signatures
+            keccak256(abi.encode(SET_THRESHOLD_TYPEHASH, newThreshold, signerNonce, deadline)), deadline, signatures
         );
 
         _setThreshold(newThreshold);
