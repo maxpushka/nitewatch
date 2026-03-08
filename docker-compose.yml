@@ -8,6 +8,6 @@ services:
       - ./config.yaml:/app/config.yaml:ro
       - ./data:/app/data
     environment:
-      NITEWATCH_CONFIG: /app/config.yaml
+      NITEWATCH_CONFIG_PATH: /app/config.yaml
       NITEWATCH_DB_PATH: /app/data/nitewatch.db
     restart: unless-stopped
