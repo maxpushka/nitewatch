@@ -142,7 +142,7 @@ func parse(data []byte) (*Config, error) {
 	}
 
 	if cfg.ListenAddr == "" {
-		cfg.ListenAddr = ":8080"
+		cfg.ListenAddr = "127.0.0.1:8080"
 	}
 
 	if cfg.Blockchain.PollInterval == 0 {

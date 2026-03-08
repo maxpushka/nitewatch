@@ -53,9 +53,18 @@ type httpServer struct {
 	server *http.Server
 }
 
-func newHTTPServer(addr string) *httpServer {
+func newHTTPServer(addr string, ready *int32) *httpServer {
 	engine := gin.New()
 	engine.Use(gin.Recovery())
+
+	engine.GET("/healthz", func(c *gin.Context) {
+		if atomic.LoadInt32(ready) == 1 {
+			c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		} else {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "starting"})
+		}
+	})
+
 	return &httpServer{
 		Engine: engine,
 		server: &http.Server{Addr: addr, Handler: engine},
@@ -80,7 +89,7 @@ type Service struct {
 	// txMu serializes transaction submissions to prevent nonce contention.
 	txMu sync.Mutex
 
-	workerReady int32
+	workerReady *int32
 }
 
 // New creates a Service that dials an Ethereum node via the configured RPC URL.
@@ -112,7 +121,8 @@ func NewWithBackend(conf config.Config, client custody.EthBackend) (*Service, er
 
 	logger.Info("Logger initialized", "level", logLevel.String())
 
-	srv := newHTTPServer(conf.ListenAddr)
+	var workerReady int32
+	srv := newHTTPServer(conf.ListenAddr, &workerReady)
 
 	gormDB, err := gorm.Open(sqlite.Open(conf.DBPath), &gorm.Config{})
 	if err != nil {
@@ -169,24 +179,25 @@ func NewWithBackend(conf config.Config, client custody.EthBackend) (*Service, er
 	listener := custody.NewListener(client, addr, conf.Blockchain.ConfirmationBlocks, conf.Blockchain.PollInterval, withdrawContract, nil)
 
 	return &Service{
-		Config:    conf,
-		Logger:    logger,
-		web:       srv,
-		ethClient: client,
-		contract:  withdrawContract,
-		listener:  listener,
-		auth:      auth,
-		checker:   chk,
-		store:     db,
+		Config:      conf,
+		Logger:      logger,
+		web:         srv,
+		ethClient:   client,
+		contract:    withdrawContract,
+		listener:    listener,
+		auth:        auth,
+		checker:     chk,
+		store:       db,
+		workerReady: &workerReady,
 	}, nil
 }
 
 func (svc *Service) IsWorkerReady() bool {
-	return atomic.LoadInt32(&svc.workerReady) == 1
+	return atomic.LoadInt32(svc.workerReady) == 1
 }
 
 func (svc *Service) setWorkerReady() {
-	atomic.StoreInt32(&svc.workerReady, 1)
+	atomic.StoreInt32(svc.workerReady, 1)
 }
 
 func (svc *Service) RunWorker() error {

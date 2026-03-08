@@ -63,6 +63,17 @@ sequenceDiagram
     NeoDAX->>NeoDAX: Debit balance (if finalized)
 ```
 
+## Deployments
+
+| Network | Contract | Address |
+|---------|----------|---------|
+| Ethereum Mainnet | ThresholdCustody | [`0x3a9624f9bb2dc43e90c0699ddc4a9b6bec147cde`](https://etherscan.io/address/0x3a9624f9bb2dc43e90c0699ddc4a9b6bec147cde#code) |
+
+**Contract details:**
+- Solidity `0.8.30` (Prague EVM)
+- Compiler optimization: 1,000,000 runs
+- License: MIT
+
 ## Usage
 
 ### Running the daemon
@@ -162,9 +173,19 @@ limits:
     hourly: "10000000"               # 0.1 WBTC
     daily:  "100000000"              # 1 WBTC
 
-listen_addr: ":8080"
+listen_addr: "127.0.0.1:8080"
 db_path: "nitewatch.db"
 ```
+
+### Health check
+
+The daemon exposes a `/healthz` endpoint on `listen_addr` (localhost-only by default):
+
+```bash
+curl http://127.0.0.1:8080/healthz
+```
+
+Returns `200 {"status":"ok"}` when the worker is ready, or `503 {"status":"starting"}` during initialization.
 
 ### Per-user overrides
 
