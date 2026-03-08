@@ -14,7 +14,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-//go:embed config.yaml
+//go:embed config.default.yaml
 var DefaultConfig []byte
 
 type Config struct {

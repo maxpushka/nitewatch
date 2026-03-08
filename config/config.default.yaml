@@ -1,0 +1,41 @@
+blockchain:
+  rpc_url: "${NITEWATCH_RPC_URL}"
+  contract_address: "${NITEWATCH_CONTRACT_ADDRESS}"
+  private_key: "${NITEWATCH_PRIVATE_KEY}"
+  confirmation_blocks: 12
+  start_block: 24593000
+
+limits:
+  # Native ETH (zero address)
+  "0x0000000000000000000000000000000000000000":
+    hourly: "10000000000000000000"   # 10 ETH
+    daily:  "100000000000000000000"  # 100 ETH
+
+  # USDT
+  "0xdAC17F958D2ee523a2206206994597C13D831ec7":
+    hourly: "10000000000"   # 10000 USDT
+    daily:  "100000000000"  # 100000 USDT
+
+  # BNB
+  "0xB8c77482e45F1F44dE1745F52C74426C631bDD52":
+    hourly: "10000000000000000000"   # 10 BNB
+    daily:  "100000000000000000000"  # 100 BNB
+
+  # WSOL
+  "0xD31a59c85aE9D8edEFeC411D448f90841571b89c":
+    hourly: "100000000000"   # 100 WSOL
+    daily:  "1000000000000"  # 1000 WSOL
+
+  # WBTC
+  "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599":
+    hourly: "10000000"   # 0.1 WBTC
+    daily:  "100000000"  # 1 WBTC
+
+# per_user_overrides:
+#   "0xUserAddress...":
+#     "0x0000000000000000000000000000000000000000":
+#       hourly: "5000000000000000000"
+#       daily:  "50000000000000000000"
+
+listen_addr: ":8080"
+db_path: "nitewatch.db"
